@@ -32,6 +32,13 @@ its final `exec`, so the vendor's chown, `[admins]` block and `setpriv` drop all
   so the health check is not held up: it waits for each peer's `/_up`, `PUT`s it into
   `_node/_local/_nodes`, and creates `_users`, `_replicator` and `_global_changes` only
   once every node is registered — created earlier they land with `n=1` and stay that way.
+- **Derives the admin password hash deterministically.** CouchDB hashes a plaintext
+  `[admins]` password with a random salt per node, and an `AuthSession` cookie is an
+  HMAC over that salt — so behind a load balancer a cookie minted by one node is
+  rejected by the next and `/_session` logins fail intermittently. The salt is derived
+  from `COUCHDB_SECRET`, making the stored hash byte-identical everywhere; the plaintext
+  never stays in the container's environment. A pre-hashed `COUCHDB_PASSWORD` is passed
+  through untouched.
 - **Renders the Railway configuration** into `default.d/20-railway.ini`, leaving
   `local.d/docker.ini` (where CouchDB writes runtime changes) outranking it.
 
@@ -51,6 +58,7 @@ its final `exec`, so the vendor's chown, `[admins]` block and `setpriv` drop all
 | `COUCHDB_CLUSTER_Q` | `2` | shards per database |
 | `COUCHDB_LOG_LEVEL` | `warning` | |
 | `COUCHDB_MAX_DOCUMENT_SIZE` | `8000000` | |
+| `COUCHDB_PASSWORD_ITERATIONS` | `600000` | PBKDF2 iterations for the derived admin hash |
 | `COUCHDB_CORS_ORIGINS` | unset | setting it enables CORS with credentials |
 | `PORT` | `5984` | CouchDB's clustered port |
 

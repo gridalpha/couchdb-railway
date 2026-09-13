@@ -155,13 +155,57 @@ log "rendered ${RAILWAY_INI} (role=${COUCHDB_CLUSTER_ROLE} n=${COUCHDB_CLUSTER_N
 
 mkdir -p "$DATA_DIR"
 
+# ------------------------------------------------------- deterministic admin hash
+# CouchDB hashes a plaintext [admins] password with a *random* salt on every node,
+# and an AuthSession cookie is an HMAC over that salt — so behind a load balancer a
+# cookie minted by one node is rejected by the next, and anything using /_session
+# (Fauxton's login form, CouchDB's own replicator, PouchDB) fails intermittently.
+# Deriving the salt from COUCHDB_SECRET makes the stored hash byte-identical on every
+# node, which is what turns three CouchDB processes into one login domain. It also
+# keeps the plaintext out of the container's environment.
+ADMIN_PW="${COUCHDB_PASSWORD:-}"
+: "${COUCHDB_PASSWORD_ITERATIONS:=600000}"
+case "${COUCHDB_PASSWORD:-}" in
+  -*)
+    # already a CouchDB password hash (an operator supplied their own) - pass through
+    log "admin password supplied pre-hashed; leaving it alone"
+    ADMIN_PW=""
+    ;;
+  "")
+    ;;
+  *)
+    if [ -n "${COUCHDB_SECRET:-}" ] && [ -n "${COUCHDB_USER:-}" ]; then
+      ADMIN_SALT=$(printf '%s' "${COUCHDB_SECRET}:couchdb-admin-salt:${COUCHDB_USER}" \
+        | sha256sum | cut -c1-32)
+      # CouchDB feeds PBKDF2 the salt's ASCII *hex string*, not the decoded bytes.
+      # hexpass, not pass: a password containing shell- or openssl-significant
+      # characters would otherwise be truncated or misparsed into a silently
+      # wrong hash that only fails at login.
+      ADMIN_HEXPW=$(printf '%s' "${COUCHDB_PASSWORD}" | od -An -v -tx1 | tr -d ' \n')
+      ADMIN_DK=$(openssl kdf -keylen 32 -kdfopt digest:SHA256 \
+        -kdfopt "hexpass:${ADMIN_HEXPW}" -kdfopt "salt:${ADMIN_SALT}" \
+        -kdfopt "iter:${COUCHDB_PASSWORD_ITERATIONS}" PBKDF2 \
+        | tr -d ':\n' | tr 'A-Z' 'a-z')
+      unset ADMIN_HEXPW
+      if [ ${#ADMIN_DK} -eq 64 ]; then
+        export COUCHDB_PASSWORD="-pbkdf2:sha256-${ADMIN_DK},${ADMIN_SALT},${COUCHDB_PASSWORD_ITERATIONS}"
+        log "admin password hash derived deterministically (identical on every node)"
+      else
+        log "WARNING: could not derive the admin password hash; falling back to the plaintext, so /_session cookies will not be portable between nodes"
+      fi
+      unset ADMIN_SALT ADMIN_DK
+    fi
+    ;;
+esac
+
 # ------------------------------------------------------------------ bootstrap
 # Behind the exec, never in front of it: in front it burns the health-check
 # window waiting for peers that cannot start until this service is healthy.
 bootstrap_cluster() {
   set +e
   local base="http://127.0.0.1:${COUCH_PORT}"
-  local auth="${COUCHDB_USER}:${COUCHDB_PASSWORD}"
+  # ADMIN_PW is the plaintext; COUCHDB_PASSWORD now holds the derived hash.
+  local auth="${COUCHDB_USER}:${ADMIN_PW}"
   local expected=1 peer i code n
 
   for i in $(seq 1 150); do
@@ -217,8 +261,8 @@ bootstrap_cluster() {
 }
 
 if [ "$COUCHDB_CLUSTER_ROLE" = coordinator ]; then
-  if [ -z "${COUCHDB_USER:-}" ] || [ -z "${COUCHDB_PASSWORD:-}" ]; then
-    log "FATAL: the coordinator needs COUCHDB_USER and COUCHDB_PASSWORD to bootstrap the cluster"
+  if [ -z "${COUCHDB_USER:-}" ] || [ -z "${ADMIN_PW:-}" ]; then
+    log "FATAL: the coordinator needs COUCHDB_USER and a plaintext COUCHDB_PASSWORD to bootstrap the cluster"
     exit 1
   fi
   bootstrap_cluster &
