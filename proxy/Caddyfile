@@ -1,0 +1,48 @@
+{
+	admin off
+	auto_https off
+	servers {
+		# Railway's edge reaches containers from 100.64.0.0/10; its own entry in
+		# X-Forwarded-For rotates within the public 152.233.0.0/17, so all three
+		# ranges are needed before {client_ip} lands on the real caller.
+		trusted_proxies static 100.64.0.0/10 fd00::/8 152.233.0.0/17
+	}
+}
+
+:{$PORT:8080} {
+	log {
+		output stderr
+		format console
+	}
+
+	# The proxy must health-check itself, never an upstream: until a node's
+	# container exists its private name does not resolve at all, and this
+	# service's own deployment would fail on a peer that is still starting.
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	handle {
+		reverse_proxy {$COUCHDB_UPSTREAMS:couchdb-node1.railway.internal:5984} {
+			lb_policy round_robin
+			lb_try_duration 10s
+			lb_try_interval 250ms
+
+			# /_up is the one anonymous route on the cluster
+			# (require_valid_user_except_for_up), so it can be probed with no
+			# credential in the proxy's configuration.
+			health_uri /_up
+			health_port 5984
+			health_interval 10s
+			health_timeout 5s
+			health_status 2xx
+
+			# CouchDB's _changes feed streams; buffering it would turn a live
+			# follower into a stalled connection.
+			flush_interval -1
+
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Real-IP {client_ip}
+		}
+	}
+}
